@@ -81,6 +81,32 @@ Frontend: `cd frontend && corepack pnpm install`
 | `/api/session` | GET | None | Issue JWT session token |
 | `/api/metadata` | GET | None | Return app metadata (useCase, framework, language) |
 | `/api/live-transcription` | WS | JWT | Streams microphone audio to Deepgram for real-time transcription. |
+| `/api/tts` | POST | JWT (Bearer) | One-shot text-to-speech. Returns `{audio_base64, output_format, sample_rate}`. |
+| `/api/tts/stream` | POST | JWT (Bearer) | Streaming text-to-speech as newline-delimited JSON (NDJSON) chunks. |
+| `/api/tts/ws` | WS | JWT (subprotocol) | Live text-to-speech; normalized WebSocket protocol (see `tts.py`). |
+
+## Text-to-Speech (TTS)
+
+In addition to Deepgram speech-to-text, the app provides TTS through two
+interchangeable providers behind one normalized interface. The provider is
+selected per-request via the `?provider=` query param (`60db` or `elevenlabs`).
+
+- **Provider abstraction:** `tts.py` — `TTSProvider` base class + `SixtyDBProvider`
+  + `ElevenLabsProvider` + a registry (`get_provider`). Each provider implements
+  `synthesize()` (one-shot), `stream()` (NDJSON), and the `ws_*` hooks used by the
+  generic `WSProxy`.
+- **Normalized options** (same for both providers): `voice_id`, `model_id`
+  (ElevenLabs only), `speed` (0.5–2.0), `stability` (0–100), `similarity` (0–100),
+  `output_format` (`mp3` | `wav` | `pcm16`), `sample_rate`. The abstraction converts
+  these to each provider's native shape (e.g. ElevenLabs receives `stability`/`similarity`
+  as 0.0–1.0).
+- **Normalized responses:** one-shot/stream return base64 audio in JSON/NDJSON
+  regardless of provider; the live WebSocket emits `{type: "audio"|"done"|"error"}`.
+- **Frontend:** `frontend/tts.js` drives a "Synthesize" tab (added to `index.html`)
+  with all three modes and audio playback (live PCM is scheduled via Web Audio).
+
+To add a third provider: subclass `TTSProvider`, implement the methods, and register
+it in `_PROVIDERS` in `tts.py`. No route or frontend changes are required.
 
 ## Customization Guide
 
@@ -142,7 +168,9 @@ The frontend is a git submodule from `deepgram-starters/live-transcription-html`
 
 | Variable | Required | Default | Purpose |
 |----------|----------|---------|---------|
-| `DEEPGRAM_API_KEY` | Yes | — | Deepgram API key |
+| `DEEPGRAM_API_KEY` | Yes | — | Deepgram API key (speech-to-text) |
+| `SIXTYDB_API_KEY` | For 60db TTS | — | 60db API key (text-to-speech) |
+| `ELEVENLABS_API_KEY` | For ElevenLabs TTS | — | ElevenLabs API key (text-to-speech) |
 | `PORT` | No | `8081` | Backend server port |
 | `HOST` | No | `0.0.0.0` | Backend bind address |
 | `SESSION_SECRET` | No | — | JWT signing secret (production) |

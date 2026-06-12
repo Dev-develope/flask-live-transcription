@@ -11,13 +11,15 @@ API Endpoints:
 """
 
 import functools
+import json
 import os
 import secrets
+import sys
 import threading
 import time
 
 import jwt
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
 from flask_sock import Sock
 from flask_cors import CORS
 from simple_websocket import Server as _WsServer
@@ -25,6 +27,8 @@ from urllib.parse import urlencode
 import websocket
 import toml
 from dotenv import load_dotenv
+
+import tts
 
 # Monkey-patch simple-websocket to echo back the access_token.* subprotocol.
 # flask-sock uses simple-websocket's Server class for the WebSocket handshake.
@@ -81,6 +85,48 @@ def validate_ws_token():
         return token_proto
     except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
         return None
+
+
+def validate_http_token():
+    """Validates a session JWT from the `Authorization: Bearer <jwt>` header."""
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return False
+    token = auth[len("Bearer "):].strip()
+    try:
+        jwt.decode(token, SESSION_SECRET, algorithms=["HS256"])
+        return True
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        return False
+
+
+# ============================================================================
+# TTS PROVIDER KEYS - 60db and ElevenLabs (validated lazily per request)
+# ============================================================================
+
+TTS_API_KEYS = {
+    "60db": os.environ.get("SIXTYDB_API_KEY"),
+    "elevenlabs": os.environ.get("ELEVENLABS_API_KEY"),
+}
+
+
+def resolve_tts_provider():
+    """
+    Resolve the TTS provider for this request from ?provider=, instantiated with
+    its configured key. Returns (provider, None) on success or (None, (json, status))
+    describing the error so the caller can return it.
+    """
+    name = request.args.get("provider", "60db")
+    try:
+        provider = tts.get_provider(name, TTS_API_KEYS)
+    except KeyError:
+        return None, (jsonify({
+            "error": "BAD_REQUEST",
+            "message": f"Unknown provider '{name}'. Supported: {tts.available_providers()}",
+        }), 400)
+    except ValueError as e:
+        return None, (jsonify({"error": "CONFIG_ERROR", "message": str(e)}), 500)
+    return provider, None
 
 
 # ============================================================================
@@ -159,7 +205,7 @@ def get_metadata():
     Required for standardization compliance
     """
     try:
-        with open('deepgram.toml', 'r') as f:
+        with open('deepgram.toml', 'r', encoding='utf-8') as f:
             config = toml.load(f)
 
         if 'meta' not in config:
@@ -182,6 +228,100 @@ def get_metadata():
             'error': 'INTERNAL_SERVER_ERROR',
             'message': f'Failed to read metadata from deepgram.toml: {str(e)}'
         }), 500
+
+# ============================================================================
+# TTS ROUTES - Text-to-Speech (provider selected via ?provider=60db|elevenlabs)
+# ============================================================================
+
+def _tts_request_payload():
+    """Extract (text, normalized_options) from a JSON POST body, or an error tuple."""
+    body = request.get_json(silent=True) or {}
+    text = (body.get("text") or "").strip()
+    if not text:
+        return None, None, (jsonify({"error": "BAD_REQUEST", "message": "'text' is required"}), 400)
+    return text, tts.normalize_options(body), None
+
+
+@app.route("/api/tts", methods=["POST"])
+def tts_synthesize():
+    """One-shot synthesis. Returns {audio_base64, output_format, sample_rate}."""
+    if not validate_http_token():
+        return jsonify({"error": "UNAUTHORIZED", "message": "Valid session token required"}), 401
+
+    provider, err = resolve_tts_provider()
+    if err:
+        return err
+    text, opts, err = _tts_request_payload()
+    if err:
+        return err
+
+    try:
+        result = provider.synthesize(text, opts)
+        return jsonify({"success": True, "provider": provider.name, **result})
+    except Exception as e:
+        print(f"TTS synthesize error ({provider.name}): {e}")
+        return jsonify({"error": "TTS_ERROR", "message": str(e)}), 502
+
+
+@app.route("/api/tts/stream", methods=["POST"])
+def tts_stream():
+    """Streaming synthesis. Responds with newline-delimited JSON (NDJSON) chunks."""
+    if not validate_http_token():
+        return jsonify({"error": "UNAUTHORIZED", "message": "Valid session token required"}), 401
+
+    provider, err = resolve_tts_provider()
+    if err:
+        return err
+    text, opts, err = _tts_request_payload()
+    if err:
+        return err
+
+    def generate():
+        try:
+            for chunk in provider.stream(text, opts):
+                yield json.dumps(chunk) + "\n"
+        except Exception as e:
+            print(f"TTS stream error ({provider.name}): {e}")
+            yield json.dumps({"type": "error", "message": str(e)}) + "\n"
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@sock.route('/api/tts/ws')
+def tts_websocket(ws):
+    """
+    Live TTS WebSocket. Authenticated with the same access_token.<jwt> subprotocol
+    as the STT endpoint. Config comes from query params (provider, voice_id,
+    speed, stability, similarity, output_format, sample_rate). Speaks the
+    normalized WSProxy protocol documented in tts.py.
+    """
+    if not validate_ws_token():
+        ws.close(4401, "Unauthorized")
+        return
+
+    name = request.args.get("provider", "60db")
+    try:
+        provider = tts.get_provider(name, TTS_API_KEYS)
+    except KeyError:
+        ws.send(json.dumps({"type": "error", "message": f"Unknown provider '{name}'"}))
+        ws.close(1008, "Unknown provider")
+        return
+    except ValueError as e:
+        ws.send(json.dumps({"type": "error", "message": str(e)}))
+        ws.close(1011, "Provider not configured")
+        return
+
+    opts = tts.normalize_options(request.args)
+    print(f"Client connected to /api/tts/ws (provider={provider.name})")
+    try:
+        tts.WSProxy(ws, provider, opts).run()
+    finally:
+        print("Client disconnected from /api/tts/ws")
+
 
 # ============================================================================
 # WEBSOCKET ENDPOINT
@@ -347,6 +487,14 @@ def live_transcription(ws):
 # ============================================================================
 
 if __name__ == "__main__":
+    # Emoji banner below is UTF-8; Windows consoles default to cp1252 and would
+    # crash on encode. Reconfigure stdout/stderr to UTF-8 where supported.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
+
     port = CONFIG["port"]
     host = CONFIG["host"]
     debug = os.environ.get("FLASK_DEBUG", "0") == "1"
@@ -360,6 +508,10 @@ if __name__ == "__main__":
     print("📡 GET  /api/session")
     print("📡 WS   /api/live-transcription (auth required)")
     print("📡 GET  /api/metadata")
+    print("🔊 POST /api/tts            (auth required) - one-shot TTS")
+    print("🔊 POST /api/tts/stream     (auth required) - NDJSON streaming TTS")
+    print("🔊 WS   /api/tts/ws         (auth required) - live TTS")
+    print("    providers: ?provider=60db | elevenlabs")
     print("=" * 70 + "\n")
 
     app.run(host=host, port=port, debug=debug)
